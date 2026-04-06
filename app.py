@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import hashlib
+import heapq
+import math
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from io import BytesIO
@@ -26,6 +28,11 @@ class RowRecord:
     row: int
     values: tuple[Any, ...]
     row_hash: str
+
+
+MAX_INDEX_FANOUT = 200
+MAX_CANDIDATES_PER_ROW = 40
+PROGRESS_UPDATE_EVERY = 50
 
 
 def is_csv_file(file_name: str) -> bool:
@@ -86,6 +93,11 @@ def count_matching_cells(row_1: tuple[Any, ...], row_2: tuple[Any, ...], max_col
     )
 
 
+def _is_missing(value: Any) -> bool:
+    # Handle None and NaN uniformly for stable matching/indexing.
+    return value is None or (isinstance(value, float) and math.isnan(value))
+
+
 def match_updated_rows(
     unmatched_file1: list[RowRecord],
     unmatched_file2: list[RowRecord],
@@ -97,15 +109,60 @@ def match_updated_rows(
     min_match_score = max(1, int(max_columns * 0.7))
     candidates: list[tuple[int, int, int, RowRecord, RowRecord]] = []
 
+    file2_by_row: dict[int, RowRecord] = {row_record.row: row_record for row_record in unmatched_file2}
+
+    # Build a sparse inverted index on (column, value) to avoid O(n^2) row comparisons.
+    value_frequencies: dict[tuple[int, Any], int] = defaultdict(int)
+    for row_2 in unmatched_file2:
+        for column_index, value in enumerate(row_2.values, start=1):
+            if _is_missing(value):
+                continue
+            value_frequencies[(column_index, value)] += 1
+
+    file2_value_index: dict[tuple[int, Any], list[int]] = defaultdict(list)
+    for row_2 in unmatched_file2:
+        for column_index, value in enumerate(row_2.values, start=1):
+            if _is_missing(value):
+                continue
+            key = (column_index, value)
+            if value_frequencies[key] <= MAX_INDEX_FANOUT:
+                file2_value_index[key].append(row_2.row)
+
     for row_1 in unmatched_file1:
-        for row_2 in unmatched_file2:
+        candidate_counts: dict[int, int] = defaultdict(int)
+
+        for column_index, value in enumerate(row_1.values, start=1):
+            if _is_missing(value):
+                continue
+
+            key = (column_index, value)
+            for candidate_row in file2_value_index.get(key, []):
+                candidate_counts[candidate_row] += 1
+
+        if candidate_counts:
+            ranked_candidates = heapq.nlargest(
+                MAX_CANDIDATES_PER_ROW,
+                candidate_counts.items(),
+                key=lambda item: (item[1], -abs(row_1.row - item[0])),
+            )
+            candidate_rows = [candidate_row for candidate_row, _ in ranked_candidates]
+        else:
+            # Fallback for sparse/noisy rows: compare nearby positions only.
+            window_size = 25
+            candidate_rows = [
+                row_2.row for row_2 in unmatched_file2 if abs(row_1.row - row_2.row) <= window_size
+            ]
+
+        for candidate_row in candidate_rows:
+            row_2 = file2_by_row[candidate_row]
             score = count_matching_cells(row_1.values, row_2.values, max_columns)
             if score >= min_match_score:
                 # Secondary sort key prefers rows closer in original position.
                 row_distance = abs(row_1.row - row_2.row)
                 candidates.append((score, -row_distance, row_1.row, row_1, row_2))
 
-    candidates.sort(reverse=True)
+    # Sort only on numeric keys to avoid comparing RowRecord objects on ties.
+    candidates.sort(key=lambda item: (item[0], item[1], item[2]), reverse=True)
 
     pair_map: dict[int, RowRecord] = {}
     consumed_file2_rows: set[int] = set()
@@ -148,7 +205,11 @@ def build_merged_rows(
     unmatched_file1: list[RowRecord] = []
 
     for current_index, row_record in enumerate(rows_1_data, start=1):
-        if progress_callback and rows_1_data:
+        if progress_callback and rows_1_data and (
+            current_index == 1
+            or current_index == len(rows_1_data)
+            or current_index % PROGRESS_UPDATE_EVERY == 0
+        ):
             progress_callback(current_index, len(rows_1_data))
 
         candidate_indices = file2_hash_to_indices.get(row_record.row_hash)
@@ -338,6 +399,8 @@ def render_results(
     stats: dict[str, int],
     max_columns: int,
 ) -> None:
+    allow_preview = stats["rows_compared"] <= 250
+
     col1, col2, col3, col4, col5 = st.columns(5)
     col1.metric("Rows", stats["rows_compared"])
     col2.metric("Columns", stats["columns_compared"])
@@ -347,7 +410,10 @@ def render_results(
 
     st.caption("Legend: deleted rows are red, inserted rows are green, and updated rows appear twice with only the changed cells highlighted.")
 
-    merged_workbook_bytes = create_merged_workbook(merged_rows, max_columns)
+    st.info("Generating the merged Excel file. This can take longer for large files.")
+    with st.spinner("Building merged workbook... large files may take some time."):
+        merged_workbook_bytes = create_merged_workbook(merged_rows, max_columns)
+
     st.download_button(
         "Download merged workbook",
         data=merged_workbook_bytes,
@@ -355,7 +421,12 @@ def render_results(
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
-    show_preview = st.toggle("Preview merged output in app", value=True)
+    if allow_preview:
+        show_preview = st.toggle("Preview merged output in app", value=True)
+    else:
+        show_preview = False
+        st.info("Preview is disabled for files with more than 250 rows.")
+
     if show_preview:
         st.subheader("Preview")
         preview_frame = build_preview_frame(merged_rows, max_columns)
