@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import heapq
 import math
+from decimal import Decimal, InvalidOperation
+from datetime import date, datetime, time
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from io import BytesIO
@@ -21,6 +23,8 @@ class MergedRow:
     values: tuple[Any, ...]
     status: str
     changed_columns: frozenset[int]
+    source_alias: str
+    source_file_name: str
 
 
 @dataclass(frozen=True)
@@ -69,8 +73,12 @@ def load_tabular_rows(file_bytes: bytes, file_name: str, sheet_name: str) -> lis
 
 
 def compute_row_hash(row: tuple) -> str:
-    """Compute SHA256 hash of row content for comparison."""
-    row_str = "|".join("" if cell is None else str(cell) for cell in row)
+    """Compute SHA256 hash of row content for comparison (semantic, not raw str)."""
+    parts: list[str] = []
+    for cell in row:
+        key = canonical_cell_key(cell)
+        parts.append("" if key is None else repr(key))
+    row_str = "|".join(parts)
     return hashlib.sha256(row_str.encode()).hexdigest()
 
 
@@ -78,8 +86,10 @@ def get_changed_columns(row_1: tuple[Any, ...], row_2: tuple[Any, ...], max_colu
     changed_columns = {
         column_index
         for column_index in range(1, max_columns + 1)
-        if (row_1[column_index - 1] if column_index <= len(row_1) else None)
-        != (row_2[column_index - 1] if column_index <= len(row_2) else None)
+        if not cells_equal_for_compare(
+            row_1[column_index - 1] if column_index <= len(row_1) else None,
+            row_2[column_index - 1] if column_index <= len(row_2) else None,
+        )
     }
     return frozenset(changed_columns)
 
@@ -88,14 +98,106 @@ def count_matching_cells(row_1: tuple[Any, ...], row_2: tuple[Any, ...], max_col
     return sum(
         1
         for column_index in range(1, max_columns + 1)
-        if (row_1[column_index - 1] if column_index <= len(row_1) else None)
-        == (row_2[column_index - 1] if column_index <= len(row_2) else None)
+        if cells_equal_for_compare(
+            row_1[column_index - 1] if column_index <= len(row_1) else None,
+            row_2[column_index - 1] if column_index <= len(row_2) else None,
+        )
     )
 
 
 def _is_missing(value: Any) -> bool:
     # Handle None and NaN uniformly for stable matching/indexing.
     return value is None or (isinstance(value, float) and math.isnan(value))
+
+
+def _numeric_canonical(value: Any) -> tuple[str, Any] | None:
+    """
+    Stable key for int / float / Decimal so 68808.63 (float) matches
+    Decimal('68808.63') and integer-valued floats match ints.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, Decimal):
+        try:
+            if not value.is_finite():
+                return ("n", float(value))
+            return ("n", value.normalize())
+        except (InvalidOperation, ValueError, OverflowError):
+            return None
+    if isinstance(value, (int, float)):
+        if isinstance(value, float) and not math.isfinite(value):
+            return ("n", value)
+        try:
+            return ("n", Decimal(str(value)))
+        except (InvalidOperation, ValueError, OverflowError):
+            return None
+    return None
+
+
+def _unwrap_numpy_pandas_scalar(value: Any) -> Any:
+    """Coerce numpy/pandas scalars to plain Python for stable comparison."""
+    if isinstance(value, pd.Timestamp):
+        try:
+            if pd.isna(value):
+                return None
+            return value.to_pydatetime()
+        except (AttributeError, TypeError, ValueError):
+            pass
+    if hasattr(value, "item") and callable(value.item) and type(value).__module__.startswith("numpy"):
+        try:
+            return value.item()
+        except (AttributeError, ValueError):
+            pass
+    return value
+
+
+def canonical_cell_key(value: Any) -> Any:
+    """
+    Map a cell value to a hashable, order-stable form so semantically equal
+    Excel values compare equal (e.g. date vs datetime at midnight, int vs float,
+    tiny float noise).
+    """
+    value = _unwrap_numpy_pandas_scalar(value)
+    if _is_missing(value):
+        return None
+    if isinstance(value, bool):
+        return ("b", value)
+    num_key = _numeric_canonical(value)
+    if num_key is not None:
+        return num_key
+    if isinstance(value, datetime):
+        d = value.replace(tzinfo=None) if value.tzinfo else value
+        return (
+            "dt",
+            (d.year, d.month, d.day, d.hour, d.minute, d.second, d.microsecond),
+        )
+    if type(value) is date:
+        return ("dt", (value.year, value.month, value.day, 0, 0, 0, 0))
+    if isinstance(value, time):
+        return ("t", (value.hour, value.minute, value.second, value.microsecond))
+    if isinstance(value, str):
+        return ("s", value.strip())
+    return ("x", repr(value))
+
+
+def cells_equal_for_compare(a: Any, b: Any) -> bool:
+    if canonical_cell_key(a) == canonical_cell_key(b):
+        return True
+    ua = _unwrap_numpy_pandas_scalar(a)
+    ub = _unwrap_numpy_pandas_scalar(b)
+    if _is_missing(ua) and _is_missing(ub):
+        return True
+    if _is_missing(ua) or _is_missing(ub):
+        return False
+    fa_key, fb_key = _numeric_canonical(ua), _numeric_canonical(ub)
+    if fa_key is not None and fb_key is not None:
+        fa, fb = float(fa_key[1]), float(fb_key[1])
+        if math.isnan(fa) or math.isnan(fb):
+            return math.isnan(fa) and math.isnan(fb)
+        if math.isinf(fa) or math.isinf(fb):
+            return fa == fb
+        return math.isclose(fa, fb, rel_tol=1e-12, abs_tol=1e-9)
+    return False
 
 
 def match_updated_rows(
@@ -117,14 +219,14 @@ def match_updated_rows(
         for column_index, value in enumerate(row_2.values, start=1):
             if _is_missing(value):
                 continue
-            value_frequencies[(column_index, value)] += 1
+            value_frequencies[(column_index, canonical_cell_key(value))] += 1
 
     file2_value_index: dict[tuple[int, Any], list[int]] = defaultdict(list)
     for row_2 in unmatched_file2:
         for column_index, value in enumerate(row_2.values, start=1):
             if _is_missing(value):
                 continue
-            key = (column_index, value)
+            key = (column_index, canonical_cell_key(value))
             if value_frequencies[key] <= MAX_INDEX_FANOUT:
                 file2_value_index[key].append(row_2.row)
 
@@ -135,7 +237,7 @@ def match_updated_rows(
             if _is_missing(value):
                 continue
 
-            key = (column_index, value)
+            key = (column_index, canonical_cell_key(value))
             for candidate_row in file2_value_index.get(key, []):
                 candidate_counts[candidate_row] += 1
 
@@ -193,6 +295,10 @@ def build_merged_rows(
     rows_1_data: list[RowRecord],
     rows_2_data: list[RowRecord],
     max_columns: int,
+    file_1_alias: str,
+    file_1_name: str,
+    file_2_alias: str,
+    file_2_name: str,
     progress_callback: Callable[[int, int], None] | None = None,
 ) -> tuple[list[MergedRow], dict[str, int]]:
     matched_file2: set[int] = set()
@@ -245,6 +351,8 @@ def build_merged_rows(
                         values=insert_row.values,
                         status="inserted",
                         changed_columns=frozenset(range(1, max_columns + 1)),
+                        source_alias=file_2_alias,
+                        source_file_name=file_2_name,
                     )
                 )
                 emitted_insert_rows.add(next_file2_row)
@@ -254,7 +362,15 @@ def build_merged_rows(
         exact_file2_row = exact_pair_map.get(row_record.row)
         if exact_file2_row is not None:
             emit_inserts_before(exact_file2_row)
-            merged_rows.append(MergedRow(values=row_record.values, status="unchanged", changed_columns=frozenset()))
+            merged_rows.append(
+                MergedRow(
+                    values=row_record.values,
+                    status="unchanged",
+                    changed_columns=frozenset(),
+                    source_alias=file_1_alias,
+                    source_file_name=file_1_name,
+                )
+            )
             if next_file2_row <= exact_file2_row:
                 next_file2_row = exact_file2_row + 1
             continue
@@ -264,24 +380,48 @@ def build_merged_rows(
             emit_inserts_before(matched_row_2.row)
             changed_columns = get_changed_columns(row_record.values, matched_row_2.values, max_columns)
             merged_rows.append(
-                MergedRow(values=row_record.values, status="updated_file1", changed_columns=changed_columns)
+                MergedRow(
+                    values=row_record.values,
+                    status="updated_file1",
+                    changed_columns=changed_columns,
+                    source_alias=file_1_alias,
+                    source_file_name=file_1_name,
+                )
             )
             merged_rows.append(
-                MergedRow(values=matched_row_2.values, status="updated_file2", changed_columns=changed_columns)
+                MergedRow(
+                    values=matched_row_2.values,
+                    status="updated_file2",
+                    changed_columns=changed_columns,
+                    source_alias=file_2_alias,
+                    source_file_name=file_2_name,
+                )
             )
             if next_file2_row <= matched_row_2.row:
                 next_file2_row = matched_row_2.row + 1
             continue
 
         merged_rows.append(
-            MergedRow(values=row_record.values, status="deleted", changed_columns=frozenset(range(1, max_columns + 1)))
+            MergedRow(
+                values=row_record.values,
+                status="deleted",
+                changed_columns=frozenset(range(1, max_columns + 1)),
+                source_alias=file_1_alias,
+                source_file_name=file_1_name,
+            )
         )
 
     for file2_row in range(next_file2_row, len(rows_2_data) + 1):
         if file2_row in inserted_file2_rows and file2_row not in emitted_insert_rows:
             insert_row = file2_by_row[file2_row]
             merged_rows.append(
-                MergedRow(values=insert_row.values, status="inserted", changed_columns=frozenset(range(1, max_columns + 1)))
+                MergedRow(
+                    values=insert_row.values,
+                    status="inserted",
+                    changed_columns=frozenset(range(1, max_columns + 1)),
+                    source_alias=file_2_alias,
+                    source_file_name=file_2_name,
+                )
             )
 
     # Safety: in rare non-monotonic matches, ensure no insert row is dropped.
@@ -289,7 +429,13 @@ def build_merged_rows(
         if file2_row < next_file2_row:
             insert_row = file2_by_row[file2_row]
             merged_rows.append(
-                MergedRow(values=insert_row.values, status="inserted", changed_columns=frozenset(range(1, max_columns + 1)))
+                MergedRow(
+                    values=insert_row.values,
+                    status="inserted",
+                    changed_columns=frozenset(range(1, max_columns + 1)),
+                    source_alias=file_2_alias,
+                    source_file_name=file_2_name,
+                )
             )
 
     stats = {
@@ -313,9 +459,18 @@ def create_merged_workbook(merged_rows: list[MergedRow], max_columns: int) -> by
     green_fill = PatternFill(fill_type="solid", fgColor="D9EAD3")
 
     for row_index, merged_row in enumerate(merged_rows, start=1):
+        alias_cell = worksheet.cell(row=row_index, column=1, value=merged_row.source_alias)
+        name_cell = worksheet.cell(row=row_index, column=2, value=merged_row.source_file_name)
+        if merged_row.status == "deleted":
+            alias_cell.fill = red_fill
+            name_cell.fill = red_fill
+        elif merged_row.status == "inserted":
+            alias_cell.fill = green_fill
+            name_cell.fill = green_fill
+
         for column_index in range(1, max_columns + 1):
             value = merged_row.values[column_index - 1] if column_index <= len(merged_row.values) else None
-            cell = worksheet.cell(row=row_index, column=column_index, value=value)
+            cell = worksheet.cell(row=row_index, column=column_index + 2, value=value)
 
             if merged_row.status == "deleted":
                 cell.fill = red_fill
@@ -337,12 +492,16 @@ def build_preview_frame(merged_rows: list[MergedRow], max_columns: int) -> pd.Da
     preview_rows: list[list[Any]] = []
     for merged_row in merged_rows:
         row_values = [
-            merged_row.values[column_index - 1] if column_index <= len(merged_row.values) else None
-            for column_index in range(1, max_columns + 1)
+            merged_row.source_alias,
+            merged_row.source_file_name,
+            *[
+                merged_row.values[column_index - 1] if column_index <= len(merged_row.values) else None
+                for column_index in range(1, max_columns + 1)
+            ],
         ]
         preview_rows.append(row_values)
 
-    column_names = [get_column_letter(col) for col in range(1, max_columns + 1)]
+    column_names = ["Source alias", "File name", *[get_column_letter(col) for col in range(1, max_columns + 1)]]
     return pd.DataFrame(preview_rows, columns=column_names)
 
 
@@ -355,13 +514,23 @@ def style_preview_frame(preview_frame: pd.DataFrame, merged_rows: list[MergedRow
         styles: list[str] = []
 
         for column_index in range(1, len(row) + 1):
+            if column_index <= 2:
+                if merged_row.status == "deleted":
+                    styles.append(f"background-color: {red_hex}")
+                elif merged_row.status == "inserted":
+                    styles.append(f"background-color: {green_hex}")
+                else:
+                    styles.append("")
+                continue
+
+            data_column_index = column_index - 2
             if merged_row.status == "deleted":
                 styles.append(f"background-color: {red_hex}")
             elif merged_row.status == "inserted":
                 styles.append(f"background-color: {green_hex}")
-            elif merged_row.status == "updated_file1" and column_index in merged_row.changed_columns:
+            elif merged_row.status == "updated_file1" and data_column_index in merged_row.changed_columns:
                 styles.append(f"background-color: {red_hex}")
-            elif merged_row.status == "updated_file2" and column_index in merged_row.changed_columns:
+            elif merged_row.status == "updated_file2" and data_column_index in merged_row.changed_columns:
                 styles.append(f"background-color: {green_hex}")
             else:
                 styles.append("")
@@ -375,6 +544,8 @@ def compare_workbooks(
     file_2_bytes: bytes,
     file_1_name: str,
     file_2_name: str,
+    file_1_alias: str,
+    file_2_alias: str,
     sheet_1: str,
     sheet_2: str,
     progress_callback: Callable[[int, int], None] | None = None,
@@ -390,7 +561,16 @@ def compare_workbooks(
     rows_1_data = load_sheet_rows(rows_1_raw, max_columns)
     rows_2_data = load_sheet_rows(rows_2_raw, max_columns)
 
-    merged_rows, stats = build_merged_rows(rows_1_data, rows_2_data, max_columns, progress_callback)
+    merged_rows, stats = build_merged_rows(
+        rows_1_data,
+        rows_2_data,
+        max_columns,
+        file_1_alias=file_1_alias.strip(),
+        file_1_name=file_1_name,
+        file_2_alias=file_2_alias.strip(),
+        file_2_name=file_2_name,
+        progress_callback=progress_callback,
+    )
     return merged_rows, stats, max_columns
 
 
@@ -472,6 +652,12 @@ if file_1 and file_2:
     else:
         sheet_2 = st.selectbox("Sheet from second file", sheet_names_2)
 
+    alias_col_left, alias_col_right = st.columns(2)
+    with alias_col_left:
+        file_1_alias = st.text_input("Alias for first file (merged column)", value="PROD")
+    with alias_col_right:
+        file_2_alias = st.text_input("Alias for second file (merged column)", value="QA")
+
     compare_clicked = st.button("Compare files", type="primary")
 
     if compare_clicked:
@@ -489,6 +675,8 @@ if file_1 and file_2:
                 file_2_bytes=file_2_bytes,
                 file_1_name=file_1.name,
                 file_2_name=file_2.name,
+                file_1_alias=file_1_alias,
+                file_2_alias=file_2_alias,
                 sheet_1=sheet_1,
                 sheet_2=sheet_2,
                 progress_callback=update_progress,
